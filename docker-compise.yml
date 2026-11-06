@@ -1,0 +1,11 @@
+version: '3.8'
+
+services:
+  huginn:
+    build: .
+    container_name: huginn_radar
+    restart: always # Automatically brings the bot back online 24/7 if the server crashes or restarts
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
