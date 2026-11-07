@@ -1,128 +1,152 @@
-// =====================================================================
-// 1. LIBRARIES AND ENVIRONMENT VARIABLES
-// =====================================================================
+const express = require('express');
+const { createClient } = require('@supabase/supabase-js');
+const axios = require('axios');
+const nodemailer = require('nodemailer');
+require('dotenv').config();
 
-// Loads secret keys (tokens, DB passwords) from the .env file into process.env.
-require('dotenv').config(); 
-
-const express = require('express'); // HTTP framework for setting up the webhook server
-const { createClient } = require('@supabase/supabase-js'); // Supabase (PostgreSQL) client
-const nodemailer = require('nodemailer'); // Email (Gmail) SMTP engine
-const axios = require('axios'); // HTTP POST requests to external services (Telegram API)
-
-// Starts the Express app and adds middleware to parse JSON from incoming HTTP POST request bodies.
 const app = express();
+const port = process.env.PORT || 3000;
+
+// Middleware for parsing JSON payloads
 app.use(express.json());
 
-
-// =====================================================================
-// 2. PREPARING EXTERNAL CONNECTIONS (CLIENTS)
-// =====================================================================
-
-// Supabase (PostgreSQL) client
-// Opens the database tunnel using the URL and Anon Key read from .env.
+// Initialize Supabase client
 const supabase = createClient(
-    process.env.SUPABASE_URL, 
+    process.env.SUPABASE_URL,
     process.env.SUPABASE_KEY
 );
 
-// Nodemailer (Gmail) client
-// Connects to the Gmail SMTP server using the Google App Password for authentication.
-const transporter = nodemailer.createTransport({
-  service: 'gmail',
-  auth: {
-    user: process.env.GMAIL_USER,
-    pass: process.env.GMAIL_APP_PASSWORD
-  }
+// Health Check Endpoint (Keep-Alive for UptimeRobot)
+app.get('/', (req, res) => {
+    res.status(200).send('Huginn is awake and watching!');
 });
 
-
-// =====================================================================
-// 3. MAIN BRAIN: WEBHOOK LISTENING AND FILTERING
-// =====================================================================
-
-// Main route that listens for requests coming from outside (from OpenCVE)
-app.post('/webhook', async (req, res) => {
-  try {
-    
-    // Retrieves the 'changes' array from the incoming JSON. Uses an empty array fallback so it doesn't crash if empty.
-    const alerts = req.body.changes || [];
-
-    // A single package may contain multiple vulnerabilities (CVEs), so we iterate through them one by one.
-    for (let alert of alerts) {
-      
-      // Extracts specific data from the deeper JSON levels (de-structuring/parsing)
-      const cveId = alert.cve || "Unknown-CVE"; // Official vulnerability code
-      const cvssScore = alert.details?.cvss?.v3 || 0; // Threat score (defaults to 0 if missing)
-      const description = alert.details?.description || "Description not found."; 
-      const vendor = alert.details?.vendors?.[0] || "Unknown"; // System/company
-      const product = alert.details?.products?.[0] || "Unknown"; // Software
-
-      // NOISE FILTER: Only high-severity vulnerabilities with a score of 8.0 and above are processed.
-      if (cvssScore >= 8.0) {
-        
-        console.log(`[!] CRITICAL VULNERABILITY DETECTED: ${cveId} (Score: ${cvssScore})`);
-
-        // GOAL 1: Persistent logging (Supabase PostgreSQL)
-        // Adds a record to the vulnerability table for future analysis or auditing.
-        await supabase.from('vulnerability_logs').insert([{
-          cve_id: cveId,
-          score: cvssScore,
-          vendor_product: `${vendor}/${product}`,
-          description: description
-        }]);
-
-        // GOAL 2: Detailed notification (Gmail)
-        // Sends a classic email for longer text and technical details.
-        const mailText = `Vulnerability: ${cveId}\nScore: ${cvssScore}\nSystem: ${vendor}/${product}\n\nDetails:\n${description}`;
-        await transporter.sendMail({
-          from: process.env.GMAIL_USER,
-          to: process.env.GMAIL_USER, // Sends an email to itself
-          subject: `🚨 HUGINN ALERT: New Critical Vulnerability - ${cveId}`,
-          text: mailText
-        });
-
-        // GOAL 3: Immediate alert (Telegram API)
-        // Sends a message directly to the Telegram Bot API using Axios in Markdown format.
-        await axios.post(
-          `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`,
-          {
+// Helper: Dispatch Telegram Notification
+const sendTelegramNotification = async (message) => {
+    const url = `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`;
+    try {
+        await axios.post(url, {
             chat_id: process.env.TELEGRAM_CHAT_ID,
-            text: `🚨 *CRITICAL VULNERABILITY (Score: ${cvssScore})*\n\n*ID:* ${cveId}\n*System:* ${vendor}/${product}\n\n${description}`,
-            parse_mode: "Markdown" // Allows text to appear bold (*) or italic
-          }
-        );
-        console.log(`[+] Telegram message sent successfully: ${cveId}`);
-        
-      } else {
-        // If the score is below 8.0, we just log the information to the terminal and skip it without burdening the system.
-        console.log(`[-] Low-score vulnerability skipped: ${cveId} (Score: ${cvssScore})`);
-      }
+            text: message,
+            parse_mode: 'HTML'
+        });
+        console.log('[TELEGRAM] Notification dispatched successfully.');
+    } catch (error) {
+        console.error('[TELEGRAM] Error dispatching notification:', error.response ? error.response.data : error.message);
     }
+};
 
-    // When processing is complete, we respond to OpenCVE with a "I received and processed the data" message.
-    // If this is not returned, the remote server assumes the webhook crashed and resends the same data repeatedly.
-    res.status(200).send("OK");
+// Helper: Dispatch Email Notification
+const sendEmailNotification = async (cveData) => {
+    const transporter = nodemailer.createTransport({
+        service: 'gmail',
+        auth: {
+            user: process.env.GMAIL_USER,
+            pass: process.env.GMAIL_APP_PASSWORD
+        }
+    });
 
-  } catch (error) {
-    // FAIL-LOUD: If there is a problem with the DB, mail, or Telegram, do not stay silent.
-    // Log the full details, including the actual error response from Axios (response.data), directly to the terminal.
-    console.error("[ERROR] A problem occurred while processing the webhook.");
-    console.error("Details:", error.response ? JSON.stringify(error.response.data, null, 2) : error.message);
-    
-    // Informs OpenCVE that something went wrong inside the server.
-    res.status(500).send("Internal server error");
-  }
+    const mailOptions = {
+        from: process.env.GMAIL_USER,
+        to: process.env.GMAIL_USER, // Routing back to the owner
+        subject: `🚨 CRITICAL VULNERABILITY DETECTED: ${cveData.cve}`,
+        html: `
+            <h2>⚠️ Critical Security Alert</h2>
+            <p><strong>CVE Identifier:</strong> ${cveData.cve}</p>
+            <p><strong>CVSS Score:</strong> ${cveData.cvss_score}</p>
+            <p><strong>Vendor/Product:</strong> ${cveData.vendor} / ${cveData.product}</p>
+            <p><strong>Description:</strong> ${cveData.description}</p>
+            <p><em>This alert was automatically generated by the Huginn Monitoring System.</em></p>
+        `
+    };
+
+    try {
+        await transporter.sendMail(mailOptions);
+        console.log('[EMAIL] Notification dispatched successfully.');
+    } catch (error) {
+        console.error('[EMAIL] Error dispatching notification:', error.message);
+    }
+};
+
+// Main Webhook Endpoint
+app.post('/webhook', async (req, res) => {
+    try {
+        const payload = req.body;
+        console.log('[WEBHOOK] Received payload:', JSON.stringify(payload, null, 2));
+
+        // Extract and normalize vulnerability data
+        const cve = payload.cve || payload.id;
+        const cvss_score = parseFloat(payload.cvss_score || payload.cvss || 0);
+        const vendor = payload.vendor || 'Unknown Vendor';
+        const product = payload.product || 'Unknown Product';
+        const description = payload.description || payload.summary || 'No description provided.';
+
+        if (!cve) {
+            console.warn('[WEBHOOK] Rejected payload: Missing CVE identifier.');
+            return res.status(400).send('Bad Request: Missing CVE identifier.');
+        }
+
+        // Filter: Only process High/Critical severity (CVSS >= 8.0)
+        if (cvss_score < 8.0) {
+            console.log(`[FILTER] Ignored ${cve} (CVSS: ${cvss_score} < 8.0)`);
+            return res.status(200).send('Payload acknowledged but filtered (CVSS threshold not met).');
+        }
+
+        // Deduplication: Verify existence in Supabase
+        const { data: existingRecords, error: fetchError } = await supabase
+            .from('cve_logs')
+            .select('id')
+            .eq('cve', cve);
+
+        if (fetchError) {
+            console.error('[SUPABASE] Database query error:', fetchError.message);
+            return res.status(500).send('Internal Server Error during database query.');
+        }
+
+        if (existingRecords && existingRecords.length > 0) {
+            console.log(`[DEDUPLICATION] CVE ${cve} already exists in records. Discarding.`);
+            return res.status(200).send('Payload acknowledged (Duplicate record).');
+        }
+
+        // Persistence: Insert new record into Supabase
+        const { error: insertError } = await supabase
+            .from('cve_logs')
+            .insert([{
+                cve: cve,
+                cvss_score: cvss_score,
+                vendor: vendor,
+                product: product,
+                description: description
+            }]);
+
+        if (insertError) {
+            console.error('[SUPABASE] Database insertion error:', insertError.message);
+            return res.status(500).send('Internal Server Error during database insertion.');
+        }
+        console.log(`[SUPABASE] Successfully persisted ${cve} to database.`);
+
+        // Notification: Format and dispatch alerts
+        const alertMessage = `🚨 <b>CRITICAL VULNERABILITY DETECTED</b> 🚨\n\n` +
+                             `<b>CVE:</b> ${cve}\n` +
+                             `<b>CVSS Score:</b> ${cvss_score}\n` +
+                             `<b>Vendor/Product:</b> ${vendor} / ${product}\n\n` +
+                             `<b>Description:</b>\n${description}`;
+
+        // Execute notification dispatch concurrently
+        await Promise.all([
+            sendTelegramNotification(alertMessage),
+            sendEmailNotification({ cve, cvss_score, vendor, product, description })
+        ]);
+
+        res.status(200).send('Vulnerability processed and notifications dispatched successfully.');
+
+    } catch (error) {
+        console.error('[SYSTEM] Unhandled exception in webhook processing:', error);
+        res.status(500).send('Internal Server Error');
+    }
 });
 
-
-// =====================================================================
-// 4. SERVER STARTUP
-// =====================================================================
-
-// Uses port 3000 if no special port is specified in the .env file.
-const PORT = process.env.PORT || 3000;
-
-app.listen(PORT, () => {
-  console.log(`🦅 Huginn woke up and is on standby on port ${PORT}...`);
+// Initialize Server
+app.listen(port, () => {
+    console.log(`[SYSTEM] 🦅 Huginn is operational and monitoring on port ${port}...`);
 });
