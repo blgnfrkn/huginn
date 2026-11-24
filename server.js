@@ -14,7 +14,8 @@ const supabase = createClient(
     process.env.SUPABASE_KEY
 );
 
-const KEEP_ALIVE_INTERVAL_MS = 4 * 24 * 60 * 60 * 1000; // 4 days
+const MIN_CVSS_SCORE = 0; // Test icin 0; dogrulama sonrasi 8.0 yapilabilir
+const KEEP_ALIVE_INTERVAL_MS = 4 * 24 * 60 * 60 * 1000; // 4 gun
 
 const pingSupabaseKeepAlive = async () => {
     try {
@@ -63,9 +64,9 @@ const sendEmailNotification = async (cveData) => {
     const mailOptions = {
         from: process.env.GMAIL_USER,
         to: process.env.GMAIL_USER,
-        subject: `🚨 CRITICAL VULNERABILITY DETECTED: ${cveData.cve_id}`,
+        subject: `🚨 VULNERABILITY DETECTED: ${cveData.cve_id}`,
         html: `
-            <h2>⚠️ Critical Security Alert</h2>
+            <h2>⚠️ Security Alert</h2>
             <p><strong>CVE Identifier:</strong> ${cveData.cve_id}</p>
             <p><strong>CVSS Score:</strong> ${cveData.score}</p>
             <p><strong>Vendor/Product:</strong> ${cveData.vendor_product}</p>
@@ -87,11 +88,36 @@ app.post('/webhook', async (req, res) => {
         const payload = req.body;
         console.log('[WEBHOOK] Received payload:', JSON.stringify(payload, null, 2));
 
-        const cve_id = payload.cve || payload.id;
-        const score = parseFloat(payload.cvss_score || payload.cvss || 0);
-        const vendor = payload.vendor || 'Unknown Vendor';
-        const product = payload.product || 'Unknown Product';
-        const vendor_product = `${vendor} / ${product}`; const description = payload.description \vert{}\vert{} payload.summary \vert{}\vert{} 'No description provided.';  if (!cve_id) { console.warn('[WEBHOOK] Rejected payload: Missing CVE identifier.'); return res.status(400).send('Bad Request: Missing CVE identifier.'); }  if (score < 8.0) { console.log(`[FILTER] Ignored ${cve_id} (CVSS: ${score} < 8.0)`); return res.status(200).send('Payload acknowledged but filtered (CVSS threshold not met).'); }  const { data: existingRecords, error: fetchError } = await supabase .from('vulnerability_logs') .select('id') .eq('cve_id', cve_id);  if (fetchError) { console.error('[SUPABASE] Database query error:', fetchError.message); return res.status(500).send('Internal Server Error during database query.'); }  if (existingRecords && existingRecords.length > 0) { console.log(`[DEDUPLICATION] CVE ${cve_id} already exists in records. Discarding.`);
+        const rawCve = typeof payload.cve === 'object' ? payload.cve?.id : payload.cve;
+        const cve_id = rawCve || payload.id || payload.data?.id;
+        const score = parseFloat(payload.cvss_score ?? payload.cvss ?? payload.cve?.cvss ?? 0);
+        const vendor = payload.vendor || (Array.isArray(payload.vendors) ? payload.vendors[0] : null) || 'Unknown Vendor';
+        const product = payload.product || (Array.isArray(payload.products) ? payload.products[0] : null) || 'Unknown Product';
+        const vendor_product = `${vendor} / ${product}`;
+        const description = payload.description || payload.summary || payload.cve?.summary || 'No description provided.';
+
+        if (!cve_id) {
+            console.warn('[WEBHOOK] Rejected payload: Missing CVE identifier.');
+            return res.status(400).send('Bad Request: Missing CVE identifier.');
+        }
+
+        if (score < MIN_CVSS_SCORE) {
+            console.log(`[FILTER] Ignored ${cve_id} (CVSS: ${score} < ${MIN_CVSS_SCORE})`);
+            return res.status(200).send('Payload acknowledged but filtered (CVSS threshold not met).');
+        }
+
+        const { data: existingRecords, error: fetchError } = await supabase
+            .from('vulnerability_logs')
+            .select('id')
+            .eq('cve_id', cve_id);
+
+        if (fetchError) {
+            console.error('[SUPABASE] Database query error:', fetchError.message);
+            return res.status(500).send('Internal Server Error during database query.');
+        }
+
+        if (existingRecords && existingRecords.length > 0) {
+            console.log(`[DEDUPLICATION] CVE ${cve_id} already exists in records. Discarding.`);
             return res.status(200).send('Payload acknowledged (Duplicate record).');
         }
 
@@ -110,10 +136,11 @@ app.post('/webhook', async (req, res) => {
         }
         console.log(`[SUPABASE] Successfully persisted ${cve_id} to database.`);
 
-        const alertMessage = `🚨 <b>CRITICAL VULNERABILITY DETECTED</b> 🚨\n\n` +
+        const alertMessage = `🚨 <b>VULNERABILITY DETECTED</b> 🚨\n\n` +
                              `<b>CVE:</b> ${cve_id}\n` +
                              `<b>CVSS Score:</b> ${score}\n` +
-                             `<b>Vendor/Product:</b> ${vendor_product}\n\n` + `<b>Description:</b>\n${description}`;
+                             `<b>Vendor/Product:</b> ${vendor_product}\n\n` +
+                             `<b>Description:</b>\n${description}`;
 
         await Promise.all([
             sendTelegramNotification(alertMessage),
