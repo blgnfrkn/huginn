@@ -14,7 +14,7 @@ const supabase = createClient(
     process.env.SUPABASE_KEY
 );
 
-const MIN_CVSS_SCORE = 0; // Test icin 0; dogrulama sonrasi 8.0 yapilabilir
+const MIN_CVSS_SCORE = 0; // Test icin 0; ilk gercek bildirim sonrasi 8.0 yapilabilir
 const KEEP_ALIVE_INTERVAL_MS = 4 * 24 * 60 * 60 * 1000; // 4 gun
 
 const pingSupabaseKeepAlive = async () => {
@@ -95,6 +95,11 @@ app.post('/webhook', async (req, res) => {
         const product = payload.product || (Array.isArray(payload.products) ? payload.products[0] : null) || 'Unknown Product';
         const vendor_product = `${vendor} / ${product}`;
         const description = payload.description || payload.summary || payload.cve?.summary || 'No description provided.';
+
+        if (!cve_id && payload.subscriptions) {
+            console.log('[WEBHOOK] OpenCVE test ping received successfully.');
+            return res.status(200).send('OpenCVE webhook test ping acknowledged.');
+        }
 
         if (!cve_id) {
             console.warn('[WEBHOOK] Rejected payload: Missing CVE identifier.');
